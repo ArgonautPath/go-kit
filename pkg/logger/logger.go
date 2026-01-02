@@ -14,13 +14,17 @@ type Logger interface {
 	Error(ctx context.Context, msg string, err error, fields ...Field)
 	WithFields(fields ...Field) Logger
 	WithContext(ctx context.Context) Logger
+	Prefix(prefix string) Logger
+	Close() error
 }
 
 // logger is the concrete implementation of Logger.
 type logger struct {
-	config  Config
-	fields  []Field
-	context context.Context
+	config      Config
+	fields      []Field
+	context     context.Context
+	prefix      string
+	asyncWriter *AsyncWriter // Only set when async logging is enabled
 }
 
 // New creates a new logger with the given configuration.
@@ -28,10 +32,28 @@ func New(cfg Config) (Logger, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
+
+	// Wrap writer with async writer if async logging is enabled
+	var asyncWriter *AsyncWriter
+	output := cfg.Output
+	if cfg.AsyncEnabled {
+		bufferSize := cfg.AsyncBufferSize
+		if bufferSize <= 0 {
+			bufferSize = 1000 // Default buffer size
+		}
+		asyncWriter = NewAsyncWriter(cfg.Output, bufferSize)
+		output = asyncWriter
+	}
+
+	// Update config with the output (may be wrapped with async writer)
+	cfg.Output = output
+
 	return &logger{
-		config:  cfg,
-		fields:  cfg.Fields,
-		context: context.Background(),
+		config:      cfg,
+		fields:      cfg.Fields,
+		context:     context.Background(),
+		prefix:      "",
+		asyncWriter: asyncWriter,
 	}, nil
 }
 
@@ -70,19 +92,80 @@ func (l *logger) Error(ctx context.Context, msg string, err error, fields ...Fie
 // WithFields creates a child logger with additional persistent fields.
 func (l *logger) WithFields(fields ...Field) Logger {
 	return &logger{
-		config:  l.config,
-		fields:  append(l.fields, fields...),
-		context: l.context,
+		config:      l.config,
+		fields:      append(l.fields, fields...),
+		context:     l.context,
+		prefix:      l.prefix,
+		asyncWriter: l.asyncWriter, // Share the same async writer
 	}
 }
 
 // WithContext creates a child logger with a persistent context.
 func (l *logger) WithContext(ctx context.Context) Logger {
 	return &logger{
-		config:  l.config,
-		fields:  l.fields,
-		context: ctx,
+		config:      l.config,
+		fields:      l.fields,
+		context:     ctx,
+		prefix:      l.prefix,
+		asyncWriter: l.asyncWriter, // Share the same async writer
 	}
+}
+
+// Prefix creates a child logger with a message prefix. The prefix will be prepended
+// to all log messages from this logger and its children.
+// Example:
+//
+//	logger := baseLogger.Prefix("[HTTP]")
+//	logger.Info(ctx, "request received") // Logs: "[HTTP] request received"
+func (l *logger) Prefix(prefix string) Logger {
+	// Combine prefixes if this logger already has one
+	newPrefix := prefix
+	if l.prefix != "" {
+		newPrefix = l.prefix + " " + prefix
+	}
+	return &logger{
+		config:      l.config,
+		fields:      l.fields,
+		context:     l.context,
+		prefix:      newPrefix,
+		asyncWriter: l.asyncWriter, // Share the same async writer
+	}
+}
+
+// Close gracefully shuts down the logger, flushing any buffered entries.
+// This is only needed when async logging is enabled.
+// When to call Close():
+//
+//  1. Application shutdown: Call Close() during graceful shutdown to ensure all
+//     buffered log entries are written before the application exits.
+//
+//  2. Service restarts: Before restarting a service, call Close() to flush logs
+//     and prevent data loss.
+//
+//  3. Testing: In tests with async logging, call Close() (or use defer) to ensure
+//     all log entries are processed before assertions.
+//
+//  4. Long-running services: Consider calling Close() when rotating log files or
+//     reconfiguring the logger.
+//
+// Example usage:
+//
+//	logger, _ := logger.New(logger.Config{
+//	    AsyncEnabled: true,
+//	    // ... other config
+//	})
+//	defer logger.Close() // Ensure cleanup on exit
+//
+//	// Or in shutdown handler:
+//	func gracefulShutdown() {
+//	    logger.Close() // Flush all buffered logs
+//	    // ... other cleanup
+//	}
+func (l *logger) Close() error {
+	if l.asyncWriter != nil {
+		return l.asyncWriter.Close()
+	}
+	return nil
 }
 
 // log writes a log entry.
@@ -118,11 +201,17 @@ func (l *logger) log(ctx context.Context, level Level, msg string, err error, fi
 		}
 	}
 
+	// Apply prefix to message if present
+	finalMsg := msg
+	if l.prefix != "" {
+		finalMsg = l.prefix + " " + msg
+	}
+
 	// Create log entry
 	entry := &LogEntry{
 		Timestamp: time.Now(),
 		Level:     level,
-		Message:   msg,
+		Message:   finalMsg,
 		Fields:    fieldMap,
 	}
 
@@ -148,7 +237,7 @@ func (l *logger) log(ctx context.Context, level Level, msg string, err error, fi
 		entry.RequestID = requestID
 	}
 
-	// Write the entry
+	// Write the entry (non-blocking if async is enabled)
 	_ = l.config.Output.Write(entry)
 }
 

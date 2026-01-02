@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 // mockWriter is a mock writer for testing.
@@ -126,10 +127,10 @@ func TestLevel_Enabled(t *testing.T) {
 
 func TestFields(t *testing.T) {
 	tests := []struct {
-		name   string
-		field  Field
-		key    string
-		value  interface{}
+		name  string
+		field Field
+		key   string
+		value interface{}
 	}{
 		{"string", String("key", "value"), "key", "value"},
 		{"int", Int("key", 42), "key", 42},
@@ -311,10 +312,10 @@ func TestLogger_Error(t *testing.T) {
 
 func TestLogger_LevelFiltering(t *testing.T) {
 	tests := []struct {
-		name     string
-		minLevel Level
-		logLevel Level
-		logFunc  func(Logger, context.Context, string, ...Field)
+		name      string
+		minLevel  Level
+		logLevel  Level
+		logFunc   func(Logger, context.Context, string, ...Field)
 		shouldLog bool
 	}{
 		{"debug at debug", DebugLevel, DebugLevel, func(l Logger, ctx context.Context, msg string, fields ...Field) { l.Debug(ctx, msg, fields...) }, true},
@@ -379,9 +380,9 @@ func TestLogger_WithFields(t *testing.T) {
 func TestLogger_WithContext(t *testing.T) {
 	mock := newMockWriter()
 	logger, _ := New(Config{
-		Level:  InfoLevel,
-		Output: mock,
-		Format: JSONFormat,
+		Level:                  InfoLevel,
+		Output:                 mock,
+		Format:                 JSONFormat,
 		EnableTraceCorrelation: true,
 	})
 
@@ -411,9 +412,9 @@ func TestLogger_WithContext(t *testing.T) {
 func TestLogger_AddCaller(t *testing.T) {
 	mock := newMockWriter()
 	logger, _ := New(Config{
-		Level:    InfoLevel,
-		Output:   mock,
-		Format:   JSONFormat,
+		Level:     InfoLevel,
+		Output:    mock,
+		Format:    JSONFormat,
 		AddCaller: true,
 	})
 
@@ -436,9 +437,9 @@ func TestLogger_AddCaller(t *testing.T) {
 func TestLogger_AddStacktrace(t *testing.T) {
 	mock := newMockWriter()
 	logger, _ := New(Config{
-		Level:       ErrorLevel,
-		Output:      mock,
-		Format:      JSONFormat,
+		Level:         ErrorLevel,
+		Output:        mock,
+		Format:        JSONFormat,
 		AddStacktrace: true,
 	})
 
@@ -452,6 +453,83 @@ func TestLogger_AddStacktrace(t *testing.T) {
 	entry := mock.entries[0]
 	if entry.Stacktrace == "" {
 		t.Error("Entry.Stacktrace should not be empty when AddStacktrace is enabled")
+	}
+}
+
+func TestLogger_Prefix(t *testing.T) {
+	mock := newMockWriter()
+	logger, _ := New(Config{
+		Level:  InfoLevel,
+		Output: mock,
+		Format: JSONFormat,
+	})
+
+	ctx := context.Background()
+	prefixedLogger := logger.Prefix("[HTTP]")
+	prefixedLogger.Info(ctx, "request received")
+
+	if len(mock.entries) != 1 {
+		t.Fatalf("Expected 1 entry, got %d", len(mock.entries))
+	}
+
+	entry := mock.entries[0]
+	expectedMsg := "[HTTP] request received"
+	if entry.Message != expectedMsg {
+		t.Errorf("Entry.Message = %q, want %q", entry.Message, expectedMsg)
+	}
+}
+
+func TestLogger_PrefixChaining(t *testing.T) {
+	mock := newMockWriter()
+	logger, _ := New(Config{
+		Level:  InfoLevel,
+		Output: mock,
+		Format: JSONFormat,
+	})
+
+	ctx := context.Background()
+	// Chain multiple prefixes
+	prefixedLogger := logger.Prefix("[HTTP]").Prefix("[Handler]")
+	prefixedLogger.Info(ctx, "processing request")
+
+	if len(mock.entries) != 1 {
+		t.Fatalf("Expected 1 entry, got %d", len(mock.entries))
+	}
+
+	entry := mock.entries[0]
+	expectedMsg := "[HTTP] [Handler] processing request"
+	if entry.Message != expectedMsg {
+		t.Errorf("Entry.Message = %q, want %q", entry.Message, expectedMsg)
+	}
+}
+
+func TestLogger_PrefixWithFields(t *testing.T) {
+	mock := newMockWriter()
+	logger, _ := New(Config{
+		Level:  InfoLevel,
+		Output: mock,
+		Format: JSONFormat,
+	})
+
+	ctx := context.Background()
+	// Combine prefix with fields
+	prefixedLogger := logger.Prefix("[DB]").WithFields(String("table", "users"))
+	prefixedLogger.Info(ctx, "query executed", Int("rows", 10))
+
+	if len(mock.entries) != 1 {
+		t.Fatalf("Expected 1 entry, got %d", len(mock.entries))
+	}
+
+	entry := mock.entries[0]
+	expectedMsg := "[DB] query executed"
+	if entry.Message != expectedMsg {
+		t.Errorf("Entry.Message = %q, want %q", entry.Message, expectedMsg)
+	}
+	if entry.Fields["table"] != "users" {
+		t.Errorf("Entry.Fields[table] = %v, want %v", entry.Fields["table"], "users")
+	}
+	if entry.Fields["rows"] != 10 {
+		t.Errorf("Entry.Fields[rows] = %v, want %v", entry.Fields["rows"], 10)
 	}
 }
 
@@ -564,3 +642,135 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestAsyncLogger_NonBlocking(t *testing.T) {
+	mock := newMockWriter()
+	logger, err := New(Config{
+		Level:           InfoLevel,
+		Output:          mock,
+		Format:          JSONFormat,
+		AsyncEnabled:    true,
+		AsyncBufferSize: 10,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer logger.Close()
+
+	ctx := context.Background()
+
+	// Write multiple entries rapidly - should not block
+	for i := 0; i < 20; i++ {
+		logger.Info(ctx, "test message", Int("index", i))
+	}
+
+	// Give the async worker time to process
+	time.Sleep(100 * time.Millisecond)
+
+	// Should have processed at least some entries (up to buffer size)
+	if len(mock.entries) == 0 {
+		t.Error("Expected some entries to be written")
+	}
+}
+
+func TestAsyncLogger_DropWhenFull(t *testing.T) {
+	mock := newMockWriter()
+	logger, err := New(Config{
+		Level:           InfoLevel,
+		Output:          mock,
+		Format:          JSONFormat,
+		AsyncEnabled:    true,
+		AsyncBufferSize: 5, // Small buffer
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer logger.Close()
+
+	ctx := context.Background()
+
+	// Fill buffer and overflow
+	for i := 0; i < 100; i++ {
+		logger.Info(ctx, "test message", Int("index", i))
+	}
+
+	// Give the async worker time to process
+	time.Sleep(200 * time.Millisecond)
+
+	// Should have written some entries, but not all due to drops
+	// The exact number depends on timing, but should be less than 100
+	if len(mock.entries) >= 100 {
+		t.Errorf("Expected some entries to be dropped, but got %d entries", len(mock.entries))
+	}
+}
+
+func TestAsyncLogger_GracefulShutdown(t *testing.T) {
+	mock := newMockWriter()
+	logger, err := New(Config{
+		Level:           InfoLevel,
+		Output:          mock,
+		Format:          JSONFormat,
+		AsyncEnabled:    true,
+		AsyncBufferSize: 10,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Write some entries
+	for i := 0; i < 5; i++ {
+		logger.Info(ctx, "test message", Int("index", i))
+	}
+
+	// Close should drain and wait for all entries to be written
+	err = logger.Close()
+	if err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+
+	// All entries should be written after close
+	if len(mock.entries) != 5 {
+		t.Errorf("Expected 5 entries after close, got %d", len(mock.entries))
+	}
+
+	// Closing again should be safe
+	err = logger.Close()
+	if err != nil {
+		t.Errorf("Close() second time error = %v", err)
+	}
+}
+
+func TestAsyncLogger_ChildLoggers(t *testing.T) {
+	mock := newMockWriter()
+	baseLogger, err := New(Config{
+		Level:           InfoLevel,
+		Output:          mock,
+		Format:          JSONFormat,
+		AsyncEnabled:    true,
+		AsyncBufferSize: 10,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer baseLogger.Close()
+
+	ctx := context.Background()
+
+	// Create child loggers
+	child1 := baseLogger.WithFields(String("source", "child1"))
+	child2 := baseLogger.Prefix("[PREFIX]")
+
+	// Write from different loggers
+	child1.Info(ctx, "message 1")
+	child2.Info(ctx, "message 2")
+	baseLogger.Info(ctx, "message 3")
+
+	// Give time to process
+	time.Sleep(100 * time.Millisecond)
+
+	// All should be written
+	if len(mock.entries) != 3 {
+		t.Errorf("Expected 3 entries, got %d", len(mock.entries))
+	}
+}

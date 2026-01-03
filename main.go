@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"go-kit/pkg/logger"
+
+	"github.com/ArgonautPath/go-kit/pkg/logger"
 )
 
 func main() {

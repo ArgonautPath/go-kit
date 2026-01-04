@@ -56,5 +56,6 @@ examples:
 	@go build -o bin/logger-demo ./examples/logger-demo
 	@go build -o bin/config-demo ./examples/config-demo
 	@go build -o bin/httpclient-demo ./examples/httpclient-demo
+	@go build -o bin/middleware-demo ./examples/middleware-demo
 	@echo "All examples built successfully!"
 
